@@ -3,7 +3,6 @@ import numpy as np
 from pymoo.problems import get_problem
 from torch import Tensor
 
-
 class BenchmarkProblem:
     """
     Класс-адаптер: берет задачу из Pymoo и готовит её для BoTorch.
@@ -21,7 +20,6 @@ class BenchmarkProblem:
             np.stack([xl, xu]),
             dtype=torch.float64
         )
-
     def evaluate(self, x: Tensor) -> Tensor:
         """
         Принимает тензор параметров от BoTorch, считает результат через Pymoo
@@ -43,12 +41,8 @@ class BenchmarkProblem:
     def get_ref_point(self):
         """
         Возвращает точку отсчета (Reference Point) для расчета гиперобъема.
+        В BoTorch мы максимизируем (-f), поэтому используем отрицательные значения.
         """
-        # Пример для DTLZ2 с 2 целями (из твоей ссылки):
-        if self.name == "dtlz2" and self.num_objectives == 2:
-            # В Optuna Hub точка указана для минимизации (например, 1.1, 1.1).
-            # Так как мы максимизируем (-f), точка превращается в -1.1
-            return torch.tensor([-1.1, -1.1], dtype=torch.float64)
-
-        # Заглушка для других задач (нужно будет дополнить по мере выбора задач)
-        return torch.tensor([-2.0] * self.num_objectives, dtype=torch.float64)
+        # Универсальная точка -1.1 отлично подходит для нормализованных
+        # задач семейства DTLZ/ZDT для любого количества целей.
+        return torch.tensor([-1.1] * self.num_objectives, dtype=torch.float64)
