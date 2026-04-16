@@ -15,6 +15,9 @@ from botorch.sampling.normal import SobolQMCNormalSampler
 # ВАЖНО: Новый импорт для BoTorch 0.17.2
 from botorch.utils.multi_objective.box_decompositions.non_dominated import NondominatedPartitioning
 
+from gpytorch.priors import GammaPrior
+from gpytorch.kernels import ScaleKernel, MaternKernel
+from botorch.models.transforms import Standardize, Normalize
 class BotorchRunner:
     def __init__(self, problem, acq_type="qEHVI", device=None, dtype=torch.float64):
         """
@@ -44,19 +47,31 @@ class BotorchRunner:
         self.train_x = torch.cat([self.train_x, new_x])
         self.train_y = torch.cat([self.train_y, new_y])
 
+
+
     def _get_fitted_model(self):
-        """
-        ШАГ 2: Построение суррогата (модели мира).
-        """
         models = []
         for i in range(self.problem.num_objectives):
             train_y_slice = self.train_y[:, i: i + 1]
 
+            # Используем Matern 5/2 с жестким априорным распределением
+            # Это заставляет модель сохранять высокую неопределенность в неизученных зонах
+            covar_module = ScaleKernel(
+                MaternKernel(
+                    nu=2.5,
+                    ard_num_dims=self.problem.dim,
+                    lengthscale_prior=GammaPrior(3.0, 6.0),  # Не дает "залипнуть" в одной точке
+                ),
+                outputscale_prior=GammaPrior(2.0, 0.15),
+            )
+
             gp = SingleTaskGP(
                 train_X=self.train_x,
                 train_Y=train_y_slice,
+                # Обязательно используем встроенные трансформеры
                 input_transform=Normalize(d=self.problem.dim, bounds=self.bounds),
-                outcome_transform=Standardize(m=1)
+                outcome_transform=Standardize(m=1),
+                covar_module=covar_module
             )
             models.append(gp)
 
@@ -65,34 +80,50 @@ class BotorchRunner:
         fit_gpytorch_mll(mll)
         return model_list
 
+    #from botorch.utils.multi_objective.box_decomposition import NondominatedPartitioning
+    # Удали импорт infer_reference_point, он нам больше не нужен
+
     def _get_acq_func(self, model):
         """
-        ШАГ 3: Стратегия выбора.
+        ШАГ 3: Стратегия выбора с жесткой фильтрацией мусорных точек.
         """
         sampler = SobolQMCNormalSampler(sample_shape=torch.Size([128]))
 
         if self.acq_type == "qEHVI":
-            ref_point = self.problem.get_ref_point().to(device=self.device, dtype=self.dtype)
-
-            # ВАЖНО: Явное создание объекта разбиения для BoTorch 0.17.2
-            # Используем torch.no_grad(), так как разбиение не требует градиентов
             with torch.no_grad():
+                # 1. Используем твой фиксированный ref_point (например, [-1.1, -1.1])
+                # Это заставит алгоритм игнорировать всё, что хуже этих значений.
+                ref_point = self.problem.get_ref_point().to(device=self.device, dtype=self.dtype)
+
+                # 2. Отбрасываем NaN
+                valid_y = self.train_y[~torch.isnan(self.train_y).any(dim=1)]
+
+                # 3. Важный нюанс: для построения разбиения (partitioning)
+                # мы должны использовать только те точки, которые ЛУЧШЕ референса.
+                # Если все точки хуже - BoTorch выдаст ошибку, поэтому добавим фильтрацию.
+                better_than_ref = (valid_y > ref_point).all(dim=1)
+                if better_than_ref.any():
+                    y_for_partitioning = valid_y[better_than_ref]
+                else:
+                    # Если нормальных точек еще нет, берем все, но EHVI будет мал
+                    y_for_partitioning = valid_y
+
                 partitioning = NondominatedPartitioning(
                     ref_point=ref_point,
-                    Y=self.train_y
+                    Y=y_for_partitioning
                 )
 
             return qExpectedHypervolumeImprovement(
                 model=model,
                 ref_point=ref_point,
-                partitioning=partitioning,  # Передаем обязательный аргумент
+                partitioning=partitioning,
                 sampler=sampler,
             )
 
         elif self.acq_type == "ParEGO":
+            # Код для ParEGO оставляем без изменений, он работает по другому принципу
             weights = torch.randn(self.problem.num_objectives, device=self.device, dtype=self.dtype).abs()
             weights /= weights.sum()
-
             post_transform = ScalarizedPosteriorTransform(weights=weights)
 
             with torch.no_grad():
@@ -117,11 +148,14 @@ class BotorchRunner:
             acq_function=acq_func,
             bounds=self.bounds,
             q=n_points,
-            num_restarts=20,
-            raw_samples=512,
-            options={"batch_limit": 5, "maxiter": 200},
-        )
+            num_restarts=5,
+            raw_samples=256,
 
+        )
+        # После создания модели
+        posterior = model.posterior(candidates)
+        print(f"Model Mean: {posterior.mean.detach().squeeze()}")
+        print(f"Model Std: {posterior.variance.sqrt().detach().squeeze()}")
         new_y = self.problem.evaluate(candidates).to(device=self.device, dtype=self.dtype)
 
         self.train_x = torch.cat([self.train_x, candidates])
