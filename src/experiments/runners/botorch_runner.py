@@ -1,66 +1,175 @@
+import warnings
+
+import gpytorch
 import torch
+from botorch.acquisition.monte_carlo import qExpectedImprovement, qNoisyExpectedImprovement
+from botorch.acquisition.multi_objective.monte_carlo import qExpectedHypervolumeImprovement
+from botorch.acquisition.objective import GenericMCObjective
+from botorch.fit import fit_gpytorch_mll
 from botorch.models.gp_regression import SingleTaskGP
 from botorch.models.model_list_gp_regression import ModelListGP
 from botorch.models.transforms.input import Normalize
 from botorch.models.transforms.outcome import Standardize
-from botorch.optim.optimize import optimize_acqf
-from botorch.fit import fit_gpytorch_mll
-from gpytorch.mlls.sum_marginal_log_likelihood import SumMarginalLogLikelihood
-
-# Импорты стратегий выбора точек
-from botorch.acquisition.multi_objective.monte_carlo import qExpectedHypervolumeImprovement
-from botorch.acquisition.monte_carlo import qExpectedImprovement
-from botorch.acquisition.objective import ScalarizedPosteriorTransform
+from botorch.optim.optimize import optimize_acqf, optimize_acqf_list
 from botorch.sampling.normal import SobolQMCNormalSampler
-# ВАЖНО: Новый импорт для BoTorch 0.17.2
 from botorch.utils.multi_objective.box_decompositions.non_dominated import NondominatedPartitioning
-
+from botorch.utils.multi_objective.scalarization import get_chebyshev_scalarization
+from botorch.utils.sampling import draw_sobol_samples, sample_simplex
+from gpytorch.kernels import MaternKernel, ScaleKernel
+from gpytorch.mlls.sum_marginal_log_likelihood import SumMarginalLogLikelihood
 from gpytorch.priors import GammaPrior
-from gpytorch.kernels import ScaleKernel, MaternKernel
-from botorch.models.transforms import Standardize, Normalize
+
+try:
+    from botorch.acquisition.logei import qLogExpectedImprovement
+except ImportError:
+    qLogExpectedImprovement = None
+
+try:
+    from botorch.acquisition.logei import qLogNoisyExpectedImprovement
+except ImportError:
+    qLogNoisyExpectedImprovement = None
+
+
 class BotorchRunner:
     def __init__(self, problem, acq_type="qEHVI", device=None, dtype=torch.float64):
-        """
-        Инициализация 'двигателя' оптимизации.
-        """
         self.problem = problem
         self.acq_type = acq_type
         self.device = device if device else torch.device("cpu")
         self.dtype = dtype
 
-        # Списки тензоров
         self.train_x = torch.empty(0, problem.dim, device=self.device, dtype=self.dtype)
         self.train_y = torch.empty(0, problem.num_objectives, device=self.device, dtype=self.dtype)
-
-        # Границы задачи
         self.bounds = problem.bounds.to(device=self.device, dtype=self.dtype)
 
-    def initialize_data(self, n=10):
-        """
-        ШАГ 1: Разведка начальными точками.
-        """
-        from botorch.utils.sampling import draw_sobol_samples
+        self.sampler = SobolQMCNormalSampler(sample_shape=torch.Size([256]))
+        self.num_restarts = 20
+        self.raw_samples = 1024
+        self.opt_options = {"batch_limit": 5, "maxiter": 200}
 
-        new_x = draw_sobol_samples(bounds=self.bounds, n=n, q=1).squeeze(1)
+        self._parego_weight_bank = self._build_parego_weight_bank(bank_size=128)
+        self._parego_weight_index = 0
+        self._parego_probe_points = 128
+        self._parego_ic_pool_size = 2048
+        self._parego_max_attempts = 8
+        if qLogNoisyExpectedImprovement is not None:
+            self._parego_acq_kind = "qLogNEI"
+        elif qLogExpectedImprovement is not None:
+            self._parego_acq_kind = "qLogEI"
+        elif qNoisyExpectedImprovement is not None:
+            self._parego_acq_kind = "qNEI"
+        else:
+            self._parego_acq_kind = "qEI"
+
+        self._parego_uses_nei = self._parego_acq_kind in {"qLogNEI", "qNEI"}
+        self._parego_uses_logei = self._parego_acq_kind in {"qLogNEI", "qLogEI"}
+        self._last_acq_info = {}
+
+    def initialize_data(self, n=10):
+        lower = self.bounds[0]
+        upper = self.bounds[1]
+        anchors = torch.cat(
+            [
+                lower.unsqueeze(0),
+                lower.unsqueeze(0) + torch.eye(self.problem.dim, device=self.device, dtype=self.dtype) * (upper - lower),
+            ],
+            dim=0,
+        )
+
+        if n <= anchors.shape[0]:
+            new_x = anchors[:n]
+        else:
+            sobol_x = draw_sobol_samples(bounds=self.bounds, n=n - anchors.shape[0], q=1).squeeze(1)
+            new_x = torch.cat([anchors, sobol_x], dim=0)
+
         new_y = self.problem.evaluate(new_x).to(device=self.device, dtype=self.dtype)
 
         self.train_x = torch.cat([self.train_x, new_x])
         self.train_y = torch.cat([self.train_y, new_y])
 
+    def _build_parego_weight_bank(self, bank_size):
+        if self.problem.num_objectives == 2:
+            grid = torch.linspace(1e-3, 1.0 - 1e-3, steps=bank_size, device=self.device, dtype=self.dtype)
+            ordered = []
+            left = 0
+            right = bank_size - 1
+            while left <= right:
+                ordered.append(grid[left])
+                if left != right:
+                    ordered.append(grid[right])
+                left += 1
+                right -= 1
 
+            first_objective_weights = torch.stack(ordered[:bank_size])
+            weights = torch.stack(
+                [first_objective_weights, 1.0 - first_objective_weights],
+                dim=-1,
+            )
+            return weights / weights.sum(dim=-1, keepdim=True)
+
+        weights = sample_simplex(
+            d=self.problem.num_objectives,
+            n=bank_size,
+            qmc=True,
+            seed=0,
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+        weights = weights.clamp_min(1e-3)
+        return weights / weights.sum(dim=-1, keepdim=True)
+
+    def _next_parego_weights(self, n_points):
+        bank_size = self._parego_weight_bank.shape[0]
+        indices = (torch.arange(n_points, device=self.device) + self._parego_weight_index) % bank_size
+        self._parego_weight_index = int((self._parego_weight_index + n_points) % bank_size)
+        return self._parego_weight_bank[indices]
+
+    def _get_valid_train_y(self):
+        valid_y = self.train_y[~torch.isnan(self.train_y).any(dim=1)]
+        if valid_y.numel() == 0:
+            raise RuntimeError("No valid objective values are available.")
+        return valid_y
+
+    def _get_pareto_train_y(self):
+        valid_y = self._get_valid_train_y()
+        if valid_y.shape[0] <= 1:
+            return valid_y
+
+        is_efficient = torch.ones(valid_y.shape[0], dtype=torch.bool, device=valid_y.device)
+        for i in range(valid_y.shape[0]):
+            if not is_efficient[i]:
+                continue
+            dominates_i = (valid_y >= valid_y[i]).all(dim=1) & (valid_y > valid_y[i]).any(dim=1)
+            if dominates_i.any():
+                is_efficient[i] = False
+        return valid_y[is_efficient]
+
+    def _get_parego_scalarization(self, weights, model=None):
+        if self._parego_uses_nei:
+            if model is None:
+                raise RuntimeError("ParEGO scalarization for NEI requires a fitted model.")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                baseline_y = model.posterior(self.train_x).mean
+            scalarization = get_chebyshev_scalarization(weights=weights, Y=baseline_y)
+            return scalarization, baseline_y
+
+        valid_y = self._get_valid_train_y()
+        pareto_y = self._get_pareto_train_y()
+        scalarization_y = pareto_y if pareto_y.shape[0] >= 2 else valid_y
+        scalarization = get_chebyshev_scalarization(weights=weights, Y=scalarization_y)
+        return scalarization, valid_y
 
     def _get_fitted_model(self):
         models = []
         for i in range(self.problem.num_objectives):
-            train_y_slice = self.train_y[:, i: i + 1]
+            train_y_slice = self.train_y[:, i : i + 1]
 
-            # Используем Matern 5/2 с жестким априорным распределением
-            # Это заставляет модель сохранять высокую неопределенность в неизученных зонах
             covar_module = ScaleKernel(
                 MaternKernel(
                     nu=2.5,
                     ard_num_dims=self.problem.dim,
-                    lengthscale_prior=GammaPrior(3.0, 6.0),  # Не дает "залипнуть" в одной точке
+                    lengthscale_prior=GammaPrior(3.0, 6.0),
                 ),
                 outputscale_prior=GammaPrior(2.0, 0.15),
             )
@@ -68,94 +177,241 @@ class BotorchRunner:
             gp = SingleTaskGP(
                 train_X=self.train_x,
                 train_Y=train_y_slice,
-                # Обязательно используем встроенные трансформеры
                 input_transform=Normalize(d=self.problem.dim, bounds=self.bounds),
                 outcome_transform=Standardize(m=1),
-                covar_module=covar_module
+                covar_module=covar_module,
             )
             models.append(gp)
 
         model_list = ModelListGP(*models)
         mll = SumMarginalLogLikelihood(model_list.likelihood, model_list)
-        fit_gpytorch_mll(mll)
+
+        with warnings.catch_warnings(), gpytorch.settings.cholesky_jitter(1e-4):
+            warnings.simplefilter("ignore")
+            fit_gpytorch_mll(mll)
+
         return model_list
 
-    #from botorch.utils.multi_objective.box_decomposition import NondominatedPartitioning
-    # Удали импорт infer_reference_point, он нам больше не нужен
+    def _build_parego_acq_func(self, model, weights):
+        scalarization, baseline_y = self._get_parego_scalarization(weights, model=model)
+        objective = GenericMCObjective(scalarization)
 
-    def _get_acq_func(self, model):
-        """
-        ШАГ 3: Стратегия выбора с жесткой фильтрацией мусорных точек.
-        """
-        sampler = SobolQMCNormalSampler(sample_shape=torch.Size([128]))
+        if self._parego_acq_kind == "qLogNEI":
+            acq_func = qLogNoisyExpectedImprovement(
+                model=model,
+                objective=objective,
+                X_baseline=self.train_x,
+                sampler=self.sampler,
+                prune_baseline=True,
+                cache_root=False,
+            )
+            return acq_func, None
 
+        if self._parego_acq_kind == "qNEI":
+            acq_func = qNoisyExpectedImprovement(
+                model=model,
+                objective=objective,
+                X_baseline=self.train_x,
+                sampler=self.sampler,
+                prune_baseline=True,
+                cache_root=False,
+            )
+            return acq_func, None
+
+        best_f = scalarization(baseline_y).max()
+        acq_cls = qLogExpectedImprovement if self._parego_acq_kind == "qLogEI" else qExpectedImprovement
+        acq_func = acq_cls(model=model, objective=objective, best_f=best_f, sampler=self.sampler)
+        return acq_func, best_f
+
+    def _probe_acq_value(self, acq_func):
+        probe_x = draw_sobol_samples(bounds=self.bounds, n=self._parego_probe_points, q=1).squeeze(1)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            probe_values = acq_func(probe_x.unsqueeze(-2))
+
+        fill_value = -1e12 if self._parego_uses_logei else 0.0
+        probe_values = torch.nan_to_num(
+            probe_values.reshape(-1),
+            nan=fill_value,
+            posinf=fill_value,
+            neginf=fill_value,
+        )
+        return probe_values.max().item()
+
+    def _get_parego_initial_conditions(self, acq_func):
+        pool_x = draw_sobol_samples(bounds=self.bounds, n=self._parego_ic_pool_size, q=1).squeeze(1)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            pool_values = acq_func(pool_x.unsqueeze(-2)).reshape(-1)
+
+        fill_value = -1e12
+        pool_values = torch.nan_to_num(
+            pool_values,
+            nan=fill_value,
+            posinf=fill_value,
+            neginf=fill_value,
+        )
+
+        topk = min(self.num_restarts, pool_values.shape[0])
+        top_indices = torch.topk(pool_values, k=topk).indices
+        batch_initial_conditions = pool_x[top_indices].unsqueeze(-2)
+        best_candidate = pool_x[top_indices[0]].unsqueeze(0)
+        best_value = pool_values[top_indices[0]].item()
+        return batch_initial_conditions, best_candidate, best_value
+
+    def _get_parego_fallback_candidate(self, model, weights):
+        pool_x = draw_sobol_samples(bounds=self.bounds, n=self._parego_ic_pool_size, q=1).squeeze(1)
+        scalarization, _ = self._get_parego_scalarization(weights, model=model)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            posterior = model.posterior(pool_x)
+            optimistic_y = posterior.mean + 0.2 * posterior.variance.clamp_min(0.0).sqrt()
+            scores = scalarization(optimistic_y).reshape(-1)
+
+        scores = torch.nan_to_num(scores, nan=-1e12, posinf=-1e12, neginf=-1e12)
+        best_index = scores.argmax()
+        return pool_x[best_index : best_index + 1], scores[best_index : best_index + 1]
+
+    def _get_acq_func(self, model, n_points=1):
         if self.acq_type == "qEHVI":
             with torch.no_grad():
-                # 1. Используем твой фиксированный ref_point (например, [-1.1, -1.1])
-                # Это заставит алгоритм игнорировать всё, что хуже этих значений.
-                ref_point = self.problem.get_ref_point().to(device=self.device, dtype=self.dtype)
+                valid_y = self._get_valid_train_y()
+                default_ref_point = self.problem.get_ref_point().to(device=self.device, dtype=self.dtype)
+                y_min = valid_y.min(dim=0).values
+                y_max = valid_y.max(dim=0).values
+                span = (y_max - y_min).clamp_min(1e-3)
+                adaptive_ref_point = y_min - 0.1 * span
+                ref_point = torch.minimum(default_ref_point, adaptive_ref_point)
 
-                # 2. Отбрасываем NaN
-                valid_y = self.train_y[~torch.isnan(self.train_y).any(dim=1)]
-
-                # 3. Важный нюанс: для построения разбиения (partitioning)
-                # мы должны использовать только те точки, которые ЛУЧШЕ референса.
-                # Если все точки хуже - BoTorch выдаст ошибку, поэтому добавим фильтрацию.
                 better_than_ref = (valid_y > ref_point).all(dim=1)
-                if better_than_ref.any():
-                    y_for_partitioning = valid_y[better_than_ref]
-                else:
-                    # Если нормальных точек еще нет, берем все, но EHVI будет мал
-                    y_for_partitioning = valid_y
+                y_for_partitioning = valid_y[better_than_ref] if better_than_ref.any() else valid_y
+                partitioning = NondominatedPartitioning(ref_point=ref_point, Y=y_for_partitioning)
 
-                partitioning = NondominatedPartitioning(
+            self._last_acq_info = {"name": "qEHVI"}
+            return (
+                qExpectedHypervolumeImprovement(
+                    model=model,
                     ref_point=ref_point,
-                    Y=y_for_partitioning
-                )
-
-            return qExpectedHypervolumeImprovement(
-                model=model,
-                ref_point=ref_point,
-                partitioning=partitioning,
-                sampler=sampler,
+                    partitioning=partitioning,
+                    sampler=self.sampler,
+                ),
+                self._last_acq_info,
             )
 
-        elif self.acq_type == "ParEGO":
-            # Код для ParEGO оставляем без изменений, он работает по другому принципу
-            weights = torch.randn(self.problem.num_objectives, device=self.device, dtype=self.dtype).abs()
-            weights /= weights.sum()
-            post_transform = ScalarizedPosteriorTransform(weights=weights)
+        if self.acq_type != "ParEGO":
+            raise ValueError(f"Unsupported acquisition type: {self.acq_type}")
 
-            with torch.no_grad():
-                scalarized_y = self.train_y @ weights
-                best_f = scalarized_y.max()
+        acq_func_list = []
+        weights_used = []
+        best_f_values = []
+        probe_values = []
 
-            return qExpectedImprovement(
-                model=model,
-                best_f=best_f,
-                sampler=sampler,
-                posterior_transform=post_transform
+        for _ in range(n_points):
+            best_choice = None
+            for _ in range(self._parego_max_attempts):
+                weights = self._next_parego_weights(1).squeeze(0)
+                acq_func, best_f = self._build_parego_acq_func(model, weights)
+                probe_max = self._probe_acq_value(acq_func)
+                candidate = (probe_max, weights, best_f, acq_func)
+
+                if best_choice is None or probe_max > best_choice[0]:
+                    best_choice = candidate
+                if torch.isfinite(torch.tensor(probe_max)):
+                    break
+
+            probe_max, weights, best_f, acq_func = best_choice
+            acq_func_list.append(acq_func)
+            weights_used.append(weights.detach().cpu())
+            best_f_values.append(float(best_f.detach().cpu()) if best_f is not None else None)
+            probe_values.append(probe_max)
+
+        self._last_acq_info = {
+            "name": "ParEGO",
+            "acq_label": self._parego_acq_kind,
+            "weights": weights_used,
+            "best_f": best_f_values,
+            "probe_max": probe_values,
+        }
+
+        if n_points == 1:
+            return acq_func_list[0], self._last_acq_info
+        return acq_func_list, self._last_acq_info
+
+    def _optimize_candidates(self, model, acq_func, n_points):
+        with gpytorch.settings.cholesky_jitter(1e-4):
+            if self.acq_type == "ParEGO":
+                if n_points == 1:
+                    weights = self._last_acq_info["weights"][0].to(device=self.device, dtype=self.dtype)
+                    batch_initial_conditions, best_candidate, best_value = self._get_parego_initial_conditions(acq_func)
+                    if best_value <= -1e11:
+                        return self._get_parego_fallback_candidate(model, weights)
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            return optimize_acqf(
+                                acq_function=acq_func,
+                                bounds=self.bounds,
+                                q=1,
+                                num_restarts=batch_initial_conditions.shape[0],
+                                options=self.opt_options,
+                                batch_initial_conditions=batch_initial_conditions,
+                            )
+                    except RuntimeError:
+                        return self._get_parego_fallback_candidate(model, weights)
+                return optimize_acqf_list(
+                    acq_function_list=acq_func,
+                    bounds=self.bounds,
+                    num_restarts=self.num_restarts,
+                    raw_samples=self.raw_samples,
+                    options=self.opt_options,
+                )
+
+            return optimize_acqf(
+                acq_function=acq_func,
+                bounds=self.bounds,
+                q=n_points,
+                num_restarts=self.num_restarts,
+                raw_samples=self.raw_samples,
+                options=self.opt_options,
+                sequential=n_points > 1,
             )
 
     def run_iteration(self, n_points=1):
-        """
-        ШАГ 4: Цикл действия.
-        """
         model = self._get_fitted_model()
-        acq_func = self._get_acq_func(model)
+        acq_func, acq_info = self._get_acq_func(model, n_points=n_points)
+        candidates, acq_values = self._optimize_candidates(model, acq_func, n_points=n_points)
 
-        candidates, _ = optimize_acqf(
-            acq_function=acq_func,
-            bounds=self.bounds,
-            q=n_points,
-            num_restarts=5,
-            raw_samples=256,
+        if isinstance(acq_values, torch.Tensor):
+            fill_value = -1e12 if self._parego_uses_logei else 0.0
+            max_acq_val = torch.nan_to_num(
+                acq_values.reshape(-1),
+                nan=fill_value,
+                posinf=fill_value,
+                neginf=fill_value,
+            ).max().item()
+        else:
+            max_acq_val = float(acq_values)
 
-        )
-        # После создания модели
-        posterior = model.posterior(candidates)
-        print(f"Model Mean: {posterior.mean.detach().squeeze()}")
-        print(f"Model Std: {posterior.variance.sqrt().detach().squeeze()}")
+        if self.acq_type == "ParEGO":
+            weights_str = ", ".join(
+                "[" + ", ".join(f"{value:.3f}" for value in weights.tolist()) + "]"
+                for weights in acq_info["weights"]
+            )
+            probe_str = ", ".join(f"{value:.2e}" for value in acq_info["probe_max"])
+            print(f"ParEGO weights: {weights_str}")
+            print(f"ParEGO acquisition: {acq_info['acq_label']}")
+            print(f"ParEGO probe acq max: {probe_str}")
+
+        if (not self._parego_uses_logei and max_acq_val < 1e-8) or not torch.isfinite(torch.tensor(max_acq_val)):
+            print(f"Warning: acquisition max is nearly zero ({max_acq_val:.2e}).")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            posterior = model.posterior(candidates)
+            print(f"Model Mean: {posterior.mean.detach().squeeze()}")
+            print(f"Model Std:  {posterior.variance.sqrt().detach().squeeze()}")
+
         new_y = self.problem.evaluate(candidates).to(device=self.device, dtype=self.dtype)
 
         self.train_x = torch.cat([self.train_x, candidates])
