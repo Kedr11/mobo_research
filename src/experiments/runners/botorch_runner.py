@@ -63,6 +63,9 @@ class BotorchRunner:
         self._parego_uses_nei = self._parego_acq_kind in {"qLogNEI", "qNEI"}
         self._parego_uses_logei = self._parego_acq_kind in {"qLogNEI", "qLogEI"}
         self._last_acq_info = {}
+        self.last_iteration_info = {}
+        self.history = []
+        self.iteration_index = 0
 
     def initialize_data(self, n=10):
         lower = self.bounds[0]
@@ -409,12 +412,37 @@ class BotorchRunner:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             posterior = model.posterior(candidates)
-            print(f"Model Mean: {posterior.mean.detach().squeeze()}")
-            print(f"Model Std:  {posterior.variance.sqrt().detach().squeeze()}")
+            posterior_mean = posterior.mean.detach().squeeze()
+            posterior_std = posterior.variance.sqrt().detach().squeeze()
+            print(f"Model Mean: {posterior_mean}")
+            print(f"Model Std:  {posterior_std}")
 
         new_y = self.problem.evaluate(candidates).to(device=self.device, dtype=self.dtype)
 
         self.train_x = torch.cat([self.train_x, candidates])
         self.train_y = torch.cat([self.train_y, new_y])
+        self.iteration_index += 1
+
+        self.last_iteration_info = {
+            "iteration": self.iteration_index,
+            "acq_type": self.acq_type,
+            "acq_value": float(max_acq_val),
+            "acq_label": acq_info.get("acq_label", self.acq_type),
+            "candidate_x": candidates.detach().cpu().reshape(-1).tolist(),
+            "new_y_model_space": new_y.detach().cpu().reshape(-1).tolist(),
+            "new_y_minimization": (-new_y).detach().cpu().reshape(-1).tolist(),
+            "posterior_mean": posterior_mean.detach().cpu().reshape(-1).tolist() if isinstance(posterior_mean, torch.Tensor) else [float(posterior_mean)],
+            "posterior_std": posterior_std.detach().cpu().reshape(-1).tolist() if isinstance(posterior_std, torch.Tensor) else [float(posterior_std)],
+            "train_size": int(self.train_x.shape[0]),
+        }
+
+        if self.acq_type == "ParEGO":
+            self.last_iteration_info["parego_weights"] = [
+                [float(value) for value in weights.tolist()]
+                for weights in acq_info.get("weights", [])
+            ]
+            self.last_iteration_info["parego_probe_max"] = [float(value) for value in acq_info.get("probe_max", [])]
+
+        self.history.append(self.last_iteration_info.copy())
 
         return candidates, new_y
