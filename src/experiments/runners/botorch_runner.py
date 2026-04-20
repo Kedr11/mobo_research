@@ -31,11 +31,13 @@ except ImportError:
 
 
 class BotorchRunner:
-    def __init__(self, problem, acq_type="qEHVI", device=None, dtype=torch.float64):
+    def __init__(self, problem, acq_type="qEHVI", device=None, dtype=torch.float64, verbose=False, keep_history=False):
         self.problem = problem
         self.acq_type = acq_type
         self.device = device if device else torch.device("cpu")
         self.dtype = dtype
+        self.verbose = verbose
+        self.keep_history = keep_history
 
         self.train_x = torch.empty(0, problem.dim, device=self.device, dtype=self.dtype)
         self.train_y = torch.empty(0, problem.num_objectives, device=self.device, dtype=self.dtype)
@@ -64,8 +66,12 @@ class BotorchRunner:
         self._parego_uses_logei = self._parego_acq_kind in {"qLogNEI", "qLogEI"}
         self._last_acq_info = {}
         self.last_iteration_info = {}
-        self.history = []
+        self.history = [] if keep_history else None
         self.iteration_index = 0
+
+    def _log(self, message):
+        if self.verbose:
+            print(message)
 
     def initialize_data(self, n=10):
         lower = self.bounds[0]
@@ -402,20 +408,20 @@ class BotorchRunner:
                 for weights in acq_info["weights"]
             )
             probe_str = ", ".join(f"{value:.2e}" for value in acq_info["probe_max"])
-            print(f"ParEGO weights: {weights_str}")
-            print(f"ParEGO acquisition: {acq_info['acq_label']}")
-            print(f"ParEGO probe acq max: {probe_str}")
+            self._log(f"ParEGO weights: {weights_str}")
+            self._log(f"ParEGO acquisition: {acq_info['acq_label']}")
+            self._log(f"ParEGO probe acq max: {probe_str}")
 
         if (not self._parego_uses_logei and max_acq_val < 1e-8) or not torch.isfinite(torch.tensor(max_acq_val)):
-            print(f"Warning: acquisition max is nearly zero ({max_acq_val:.2e}).")
+            self._log(f"Warning: acquisition max is nearly zero ({max_acq_val:.2e}).")
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             posterior = model.posterior(candidates)
             posterior_mean = posterior.mean.detach().squeeze()
             posterior_std = posterior.variance.sqrt().detach().squeeze()
-            print(f"Model Mean: {posterior_mean}")
-            print(f"Model Std:  {posterior_std}")
+            self._log(f"Model Mean: {posterior_mean}")
+            self._log(f"Model Std:  {posterior_std}")
 
         new_y = self.problem.evaluate(candidates).to(device=self.device, dtype=self.dtype)
 
@@ -443,6 +449,14 @@ class BotorchRunner:
             ]
             self.last_iteration_info["parego_probe_max"] = [float(value) for value in acq_info.get("probe_max", [])]
 
-        self.history.append(self.last_iteration_info.copy())
+        if self.keep_history:
+            self.history.append(self.last_iteration_info.copy())
+
+        del model
+        del acq_func
+        del acq_values
+        del posterior
+        del posterior_mean
+        del posterior_std
 
         return candidates, new_y

@@ -6,6 +6,19 @@ import numpy as np
 import torch
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
+
+def _to_finite_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric_value):
+        return None
+    return numeric_value
+
+
 def get_pareto_front(y: torch.Tensor):
     if y.shape[0] <= 1:
         return y
@@ -180,9 +193,9 @@ def save_pareto_scatter(problem, observed_y_min: np.ndarray, pareto_y_min: np.nd
             plt.plot(true_pf[:, 0], true_pf[:, 1], color="black", alpha=0.45, label="True PF")
 
         if initial_y is not None and len(initial_y) > 0:
-            plt.scatter(initial_y[:, 0], initial_y[:, 1], s=24, alpha=0.35, color="#9AA5B1", label="Initial")
+            plt.scatter(initial_y[:, 0], initial_y[:, 1], s=34, alpha=0.7, color="#6EDFF6", label="Initial")
         if acquired_y is not None and len(acquired_y) > 0:
-            plt.scatter(acquired_y[:, 0], acquired_y[:, 1], s=22, alpha=0.35, color="#4C78A8", label="Acquired")
+            plt.scatter(acquired_y[:, 0], acquired_y[:, 1], s=30, alpha=0.78, color="#2F6BFF", label="Acquired")
         plt.scatter(
             pareto_y_min[:, 0],
             pareto_y_min[:, 1],
@@ -208,9 +221,9 @@ def save_pareto_scatter(problem, observed_y_min: np.ndarray, pareto_y_min: np.nd
         if true_pf is not None:
             ax.scatter(true_pf[:, 0], true_pf[:, 1], true_pf[:, 2], s=8, alpha=0.12, color="black", label="True PF")
         if initial_y is not None and len(initial_y) > 0:
-            ax.scatter(initial_y[:, 0], initial_y[:, 1], initial_y[:, 2], s=24, alpha=0.35, color="#9AA5B1", label="Initial")
+            ax.scatter(initial_y[:, 0], initial_y[:, 1], initial_y[:, 2], s=34, alpha=0.7, color="#6EDFF6", label="Initial")
         if acquired_y is not None and len(acquired_y) > 0:
-            ax.scatter(acquired_y[:, 0], acquired_y[:, 1], acquired_y[:, 2], s=22, alpha=0.35, color="#4C78A8", label="Acquired")
+            ax.scatter(acquired_y[:, 0], acquired_y[:, 1], acquired_y[:, 2], s=30, alpha=0.78, color="#2F6BFF", label="Acquired")
         ax.scatter(
             pareto_y_min[:, 0],
             pareto_y_min[:, 1],
@@ -240,16 +253,16 @@ def save_pareto_scatter(problem, observed_y_min: np.ndarray, pareto_y_min: np.nd
     plt.close()
 
 
-def save_metric_convergence_plot(iteration_rows, output_path, problem_name: str, metric_name: str):
+def save_metric_convergence_plot(iteration_rows, output_path, problem_name: str = None, metric_name: str = "normalized_hypervolume"):
     output_path = _prepare_output_path(output_path)
     grouped = defaultdict(lambda: defaultdict(list))
     for row in iteration_rows:
-        if row["problem_name"] != problem_name:
+        if problem_name is not None and row["problem_name"] != problem_name:
             continue
-        metric_value = row.get(metric_name)
-        if metric_value is None or np.isnan(metric_value):
+        metric_value = _to_finite_float(row.get(metric_name))
+        if metric_value is None:
             continue
-        grouped[row["method"]][int(row["iteration"])].append(float(metric_value))
+        grouped[row["method"]][int(row["iteration"])].append(metric_value)
 
     if not grouped:
         return
@@ -265,7 +278,8 @@ def save_metric_convergence_plot(iteration_rows, output_path, problem_name: str,
     plt.xlabel("Iteration")
     ylabel = "Normalized Hypervolume" if metric_name == "normalized_hypervolume" else metric_name.replace("_", " ").title()
     plt.ylabel(ylabel)
-    plt.title(f"{problem_name.upper()} | {ylabel} convergence")
+    title_prefix = problem_name.upper() if problem_name is not None else "All benchmarks"
+    plt.title(f"{title_prefix} | {ylabel} convergence")
     if metric_name == "normalized_hypervolume":
         plt.ylim(bottom=0.0)
     plt.legend()
@@ -280,19 +294,40 @@ def save_metric_boxplot(summary_rows, output_path, metric_name: str, title: str,
     for row in summary_rows:
         if problem_name is not None and row["problem_name"] != problem_name:
             continue
-        metric_value = row.get(metric_name)
-        if metric_value is None or np.isnan(metric_value):
+        metric_value = _to_finite_float(row.get(metric_name))
+        if metric_value is None:
             continue
-        grouped[row["method"]].append(float(metric_value))
+        grouped[row["method"]].append(metric_value)
 
     if not grouped:
         return
 
     labels = list(grouped.keys())
     values = [grouped[label] for label in labels]
+    positions = np.arange(1, len(labels) + 1)
 
     plt.figure(figsize=(8, 5))
-    plt.boxplot(values, labels=labels, patch_artist=True)
+    if any(len(series) >= 2 for series in values):
+        boxplot = plt.boxplot(values, labels=labels, patch_artist=True)
+        fill_colors = ["#7DB7FF", "#FFB36E", "#8FD694", "#F28E8E"]
+        for patch, color in zip(boxplot["boxes"], fill_colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.55)
+
+    for position, series in zip(positions, values):
+        jitter = np.linspace(-0.04, 0.04, len(series)) if len(series) > 1 else np.array([0.0])
+        plt.scatter(
+            np.full(len(series), position) + jitter,
+            series,
+            s=46,
+            color="#2F6BFF",
+            edgecolors="black",
+            linewidths=0.35,
+            alpha=0.9,
+            zorder=3,
+        )
+
+    plt.xticks(positions, labels)
     plt.ylabel(metric_name.replace("_", " ").title())
     plt.title(title)
     plt.tight_layout()
