@@ -1,0 +1,4 @@
+problem_name,family,description,difficulty,n_var,n_obj,n_init,n_iter,pf_points,tags
+zdt4,ZDT,Мультимодальная задача с большим числом локальных оптимумов вне фронта Парето.,medium,10,2,20,40,200,"multimodal,local-optima,deceptive"
+dtlz1,DTLZ,Линейный фронт Парето с мультимодальной функцией расстояния g(x).,medium,6,3,20,40,200,"linear-front,multimodal"
+dtlz5,DTLZ,"Дегенеративный фронт, где эффективное многообразие имеет меньшую размерность, чем число критериев.",medium,6,3,20,40,200,"degenerate-front,geometry-sensitive"

@@ -19,12 +19,17 @@ BENCHMARK_RUN_CONFIGS = {
 }
 
 
-DEFAULT_EXPERIMENT_CONFIG = {
-    "suite_name": "paper_suite",
-    "methods": list(BENCHMARK_SUITES["paper_suite"]["methods"]),
-    "benchmark_names": list(BENCHMARK_SUITES["paper_suite"]["benchmark_names"]),
-    "n_seeds": BENCHMARK_SUITES["paper_suite"]["n_seeds"],
-    "primary_metric": BENCHMARK_SUITES["paper_suite"]["primary_metric"],
-    "secondary_metrics": list(BENCHMARK_SUITES["paper_suite"]["secondary_metrics"]),
-    "dtype": torch.float64,
-}
+def get_experiment_config(suite_name: str = "paper_suite"):
+    suite = BENCHMARK_SUITES[suite_name]
+    return {
+        "suite_name": suite_name,
+        "methods": list(suite["methods"]),
+        "benchmark_names": list(suite["benchmark_names"]),
+        "n_seeds": suite["n_seeds"],
+        "primary_metric": suite["primary_metric"],
+        "secondary_metrics": list(suite["secondary_metrics"]),
+        "dtype": torch.float64,
+    }
+
+
+DEFAULT_EXPERIMENT_CONFIG = get_experiment_config("paper_suite")

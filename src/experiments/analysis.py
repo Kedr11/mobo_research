@@ -145,8 +145,10 @@ def collect_iteration_metrics(problem, observed_y_max: torch.Tensor, iteration: 
     coverage = float("nan")
 
     if true_pf is not None and len(true_pf) > 0:
-        true_pf_tensor = torch.tensor(true_pf, dtype=torch.float64)
-        ideal_hypervolume = compute_hypervolume_minimization(true_pf_tensor, ref_point_min)
+        if getattr(problem, "_ideal_hypervolume", None) is None:
+            true_pf_tensor = torch.tensor(true_pf, dtype=torch.float64)
+            problem._ideal_hypervolume = compute_hypervolume_minimization(true_pf_tensor, ref_point_min)
+        ideal_hypervolume = problem._ideal_hypervolume
         normalized_hypervolume = hypervolume / ideal_hypervolume if ideal_hypervolume > 0 else float("nan")
         pareto_np = pareto_y_min.numpy()
         gd = compute_gd(pareto_np, true_pf)

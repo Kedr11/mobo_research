@@ -43,16 +43,25 @@ class BotorchRunner:
         self.train_y = torch.empty(0, problem.num_objectives, device=self.device, dtype=self.dtype)
         self.bounds = problem.bounds.to(device=self.device, dtype=self.dtype)
 
-        self.sampler = SobolQMCNormalSampler(sample_shape=torch.Size([256]))
-        self.num_restarts = 20
-        self.raw_samples = 1024
-        self.opt_options = {"batch_limit": 5, "maxiter": 200}
+        self.parego_sampler = SobolQMCNormalSampler(sample_shape=torch.Size([192]))
+        ehvi_sample_count = 96 if problem.num_objectives >= 3 else 128
+        self.qehvi_sampler = SobolQMCNormalSampler(sample_shape=torch.Size([ehvi_sample_count]))
+        self.num_restarts = 12 if problem.num_objectives >= 3 else 20
+        self.raw_samples = 384 if problem.num_objectives >= 3 else 1024
+        self.opt_options = {
+            "batch_limit": 4 if problem.num_objectives >= 3 else 5,
+            "maxiter": 100 if problem.num_objectives >= 3 else 200,
+        }
+        self.qehvi_num_restarts = 12 if problem.num_objectives >= 3 else 16
+        self.qehvi_raw_samples = 256 if problem.num_objectives >= 3 else 384
+        self.qehvi_opt_options = {"batch_limit": 4, "maxiter": 100}
+        self._qehvi_ic_pool_size = 512 if problem.num_objectives >= 3 else 768
 
         self._parego_weight_bank = self._build_parego_weight_bank(bank_size=128)
         self._parego_weight_index = 0
-        self._parego_probe_points = 128
-        self._parego_ic_pool_size = 2048
-        self._parego_max_attempts = 8
+        self._parego_probe_points = 64 if problem.num_objectives >= 3 else 128
+        self._parego_ic_pool_size = 512 if problem.num_objectives >= 3 else 2048
+        self._parego_max_attempts = 4 if problem.num_objectives >= 3 else 8
         if qLogNoisyExpectedImprovement is not None:
             self._parego_acq_kind = "qLogNEI"
         elif qLogExpectedImprovement is not None:
@@ -76,18 +85,48 @@ class BotorchRunner:
     def initialize_data(self, n=10):
         lower = self.bounds[0]
         upper = self.bounds[1]
-        anchors = torch.cat(
-            [
-                lower.unsqueeze(0),
-                lower.unsqueeze(0) + torch.eye(self.problem.dim, device=self.device, dtype=self.dtype) * (upper - lower),
-            ],
-            dim=0,
-        )
+        span = upper - lower
+
+        if self.problem.family == "DTLZ" or self.problem.name == "zdt4":
+            center = (lower + upper) / 2.0
+            anchor_points = [center]
+
+            for boundary_value in (lower[0], upper[0]):
+                point = center.clone()
+                point[0] = boundary_value
+                anchor_points.append(point)
+
+            max_aux_dims = min(self.problem.dim - 1, 4)
+            for dim_idx in range(1, max_aux_dims + 1):
+                delta = 0.2 * span[dim_idx]
+                for direction in (-1.0, 1.0):
+                    point = center.clone()
+                    point[dim_idx] = torch.clamp(center[dim_idx] + direction * delta, lower[dim_idx], upper[dim_idx])
+                    anchor_points.append(point)
+
+            anchors = torch.stack(anchor_points, dim=0)
+            sobol_center = center
+            sobol_radius = 0.25 * span
+            sobol_bounds = torch.stack(
+                [
+                    torch.maximum(lower, sobol_center - sobol_radius),
+                    torch.minimum(upper, sobol_center + sobol_radius),
+                ]
+            )
+        else:
+            anchors = torch.cat(
+                [
+                    lower.unsqueeze(0),
+                    lower.unsqueeze(0) + torch.eye(self.problem.dim, device=self.device, dtype=self.dtype) * span,
+                ],
+                dim=0,
+            )
+            sobol_bounds = self.bounds
 
         if n <= anchors.shape[0]:
             new_x = anchors[:n]
         else:
-            sobol_x = draw_sobol_samples(bounds=self.bounds, n=n - anchors.shape[0], q=1).squeeze(1)
+            sobol_x = draw_sobol_samples(bounds=sobol_bounds, n=n - anchors.shape[0], q=1).squeeze(1)
             new_x = torch.cat([anchors, sobol_x], dim=0)
 
         new_y = self.problem.evaluate(new_x).to(device=self.device, dtype=self.dtype)
@@ -173,6 +212,9 @@ class BotorchRunner:
         models = []
         for i in range(self.problem.num_objectives):
             train_y_slice = self.train_y[:, i : i + 1]
+            target_std = train_y_slice.std(dim=0, unbiased=False).clamp_min(1.0)
+            # Keep the effective noise floor stable after Standardize().
+            train_yvar = torch.full_like(train_y_slice, 1e-4) * target_std.pow(2)
 
             covar_module = ScaleKernel(
                 MaternKernel(
@@ -186,6 +228,7 @@ class BotorchRunner:
             gp = SingleTaskGP(
                 train_X=self.train_x,
                 train_Y=train_y_slice,
+                train_Yvar=train_yvar,
                 input_transform=Normalize(d=self.problem.dim, bounds=self.bounds),
                 outcome_transform=Standardize(m=1),
                 covar_module=covar_module,
@@ -210,7 +253,7 @@ class BotorchRunner:
                 model=model,
                 objective=objective,
                 X_baseline=self.train_x,
-                sampler=self.sampler,
+                sampler=self.parego_sampler,
                 prune_baseline=True,
                 cache_root=False,
             )
@@ -221,7 +264,7 @@ class BotorchRunner:
                 model=model,
                 objective=objective,
                 X_baseline=self.train_x,
-                sampler=self.sampler,
+                sampler=self.parego_sampler,
                 prune_baseline=True,
                 cache_root=False,
             )
@@ -229,7 +272,7 @@ class BotorchRunner:
 
         best_f = scalarization(baseline_y).max()
         acq_cls = qLogExpectedImprovement if self._parego_acq_kind == "qLogEI" else qExpectedImprovement
-        acq_func = acq_cls(model=model, objective=objective, best_f=best_f, sampler=self.sampler)
+        acq_func = acq_cls(model=model, objective=objective, best_f=best_f, sampler=self.parego_sampler)
         return acq_func, best_f
 
     def _probe_acq_value(self, acq_func):
@@ -282,19 +325,35 @@ class BotorchRunner:
         best_index = scores.argmax()
         return pool_x[best_index : best_index + 1], scores[best_index : best_index + 1]
 
+    def _get_qehvi_initial_conditions(self, acq_func, n_points):
+        pool_x = draw_sobol_samples(bounds=self.bounds, n=self._qehvi_ic_pool_size, q=n_points)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            pool_values = acq_func(pool_x).reshape(-1)
+
+        pool_values = torch.nan_to_num(pool_values, nan=0.0, posinf=0.0, neginf=0.0)
+        topk = min(self.qehvi_num_restarts, pool_values.shape[0])
+        top_indices = torch.topk(pool_values, k=topk).indices
+        batch_initial_conditions = pool_x[top_indices]
+        best_candidate = pool_x[top_indices[0]]
+        best_value = pool_values[top_indices[0]].item()
+        return batch_initial_conditions, best_candidate, best_value
+
     def _get_acq_func(self, model, n_points=1):
         if self.acq_type == "qEHVI":
             with torch.no_grad():
                 valid_y = self._get_valid_train_y()
+                pareto_y = self._get_pareto_train_y()
+                y_reference = pareto_y if pareto_y.shape[0] > 0 else valid_y
                 default_ref_point = self.problem.get_ref_point().to(device=self.device, dtype=self.dtype)
-                y_min = valid_y.min(dim=0).values
-                y_max = valid_y.max(dim=0).values
+                y_min = y_reference.min(dim=0).values
+                y_max = y_reference.max(dim=0).values
                 span = (y_max - y_min).clamp_min(1e-3)
                 adaptive_ref_point = y_min - 0.1 * span
                 ref_point = torch.minimum(default_ref_point, adaptive_ref_point)
 
-                better_than_ref = (valid_y > ref_point).all(dim=1)
-                y_for_partitioning = valid_y[better_than_ref] if better_than_ref.any() else valid_y
+                better_than_ref = (y_reference > ref_point).all(dim=1)
+                y_for_partitioning = y_reference[better_than_ref] if better_than_ref.any() else y_reference
                 partitioning = NondominatedPartitioning(ref_point=ref_point, Y=y_for_partitioning)
 
             self._last_acq_info = {"name": "qEHVI"}
@@ -303,7 +362,7 @@ class BotorchRunner:
                     model=model,
                     ref_point=ref_point,
                     partitioning=partitioning,
-                    sampler=self.sampler,
+                    sampler=self.qehvi_sampler,
                 ),
                 self._last_acq_info,
             )
@@ -380,16 +439,39 @@ class BotorchRunner:
                 acq_function=acq_func,
                 bounds=self.bounds,
                 q=n_points,
-                num_restarts=self.num_restarts,
-                raw_samples=self.raw_samples,
-                options=self.opt_options,
+                num_restarts=self.qehvi_num_restarts,
+                raw_samples=self.qehvi_raw_samples,
+                options=self.qehvi_opt_options,
                 sequential=n_points > 1,
             )
+
+    def _optimize_qehvi_candidates(self, acq_func, n_points):
+        batch_initial_conditions, best_candidate, best_value = self._get_qehvi_initial_conditions(acq_func, n_points)
+        if best_value <= 0.0:
+            return best_candidate, torch.tensor([best_value], device=self.device, dtype=self.dtype)
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                return optimize_acqf(
+                    acq_function=acq_func,
+                    bounds=self.bounds,
+                    q=n_points,
+                    num_restarts=batch_initial_conditions.shape[0],
+                    options=self.qehvi_opt_options,
+                    batch_initial_conditions=batch_initial_conditions,
+                    sequential=n_points > 1,
+                )
+        except RuntimeError:
+            return best_candidate, torch.tensor([best_value], device=self.device, dtype=self.dtype)
 
     def run_iteration(self, n_points=1):
         model = self._get_fitted_model()
         acq_func, acq_info = self._get_acq_func(model, n_points=n_points)
-        candidates, acq_values = self._optimize_candidates(model, acq_func, n_points=n_points)
+        if self.acq_type == "qEHVI":
+            candidates, acq_values = self._optimize_qehvi_candidates(acq_func, n_points=n_points)
+        else:
+            candidates, acq_values = self._optimize_candidates(model, acq_func, n_points=n_points)
 
         if isinstance(acq_values, torch.Tensor):
             fill_value = -1e12 if self._parego_uses_logei else 0.0

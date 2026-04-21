@@ -1,0 +1,27 @@
+{
+  "suite_name": "paper_suite_test",
+  "methods": [
+    "ParEGO",
+    "qEHVI"
+  ],
+  "benchmark_names": [
+    "zdt4",
+    "dtlz1",
+    "dtlz5"
+  ],
+  "n_seeds": 5,
+  "primary_metric": "normalized_hypervolume",
+  "secondary_metrics": [
+    "igd",
+    "gd",
+    "spacing",
+    "pareto_size",
+    "coverage"
+  ],
+  "dtype": "torch.float64",
+  "output_root": "outputs",
+  "method_devices": {
+    "ParEGO": "cpu",
+    "qEHVI": "cpu"
+  }
+}

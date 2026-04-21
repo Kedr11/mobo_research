@@ -57,6 +57,7 @@ class BenchmarkProblem:
         self._true_pareto_front = None
         self._min_ref_point = None
         self._max_ref_point = None
+        self._ideal_hypervolume = None
 
     def evaluate(self, x: Tensor) -> Tensor:
         lower = self.bounds[0].to(device=x.device, dtype=x.dtype)
@@ -83,7 +84,13 @@ class BenchmarkProblem:
 
             if pf is None:
                 return None
-            self._true_pareto_front = np.asarray(pf, dtype=np.float64)
+            pf = np.asarray(pf, dtype=np.float64)
+            if pf.ndim == 1:
+                pf = pf[None, :]
+            if pf.shape[0] > self.pf_points:
+                indices = np.linspace(0, pf.shape[0] - 1, num=self.pf_points, dtype=int)
+                pf = pf[indices]
+            self._true_pareto_front = pf
 
         return self._true_pareto_front.copy()
 

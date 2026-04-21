@@ -1,0 +1,9 @@
+problem_name,family,description,difficulty,n_var,n_obj,n_init,n_iter,pf_points,tags
+zdt1,ZDT,Гладкий выпуклый фронт Парето. Базовая легкая задача для проверки сходимости и равномерности покрытия.,easy,6,2,20,40,200,"convex,continuous,baseline"
+zdt2,ZDT,Невыпуклый фронт Парето. Полезна для проверки устойчивости scalarization-методов на non-convex PF.,easy,6,2,20,40,200,"non-convex,continuous"
+zdt3,ZDT,Разрывный фронт Парето с несколькими несвязными сегментами.,medium,6,2,20,40,400,"disconnected,continuous"
+zdt4,ZDT,Мультимодальная задача с большим числом локальных оптимумов вне фронта Парето.,medium,10,2,20,40,200,"multimodal,local-optima,deceptive"
+zdt6,ZDT,"Фронт с неравномерной плотностью решений, полезен для оценки равномерности распределения точек.",medium,6,2,20,40,200,"non-uniform-density,continuous"
+dtlz1,DTLZ,Линейный фронт Парето с мультимодальной функцией расстояния g(x).,medium,6,3,20,40,200,"linear-front,multimodal"
+dtlz2,DTLZ,Сферический фронт Парето. Хорошая базовая задача для гладких многокритериальных фронтов.,easy,6,3,20,40,200,"spherical-front,continuous,baseline"
+dtlz5,DTLZ,"Дегенеративный фронт, где эффективное многообразие имеет меньшую размерность, чем число критериев.",medium,6,3,20,40,200,"degenerate-front,geometry-sensitive"

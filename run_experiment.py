@@ -16,12 +16,15 @@ from src.experiments.analysis import (
     save_pareto_scatter,
 )
 from src.experiments.bench.problem_loader import BenchmarkProblem, get_benchmark_config
-from src.experiments.configs.benchmark_suite import DEFAULT_EXPERIMENT_CONFIG
+from src.experiments.configs.benchmark_suite import get_experiment_config
 from src.experiments.runners.botorch_runner import BotorchRunner
 
 
+RUN_SUITE_NAME = "paper_suite_test"
+
+
 EXPERIMENT_CONFIG = {
-    **DEFAULT_EXPERIMENT_CONFIG,
+    **get_experiment_config(RUN_SUITE_NAME),
     "output_root": "outputs",
     "method_devices": {
         "ParEGO": "cpu",
